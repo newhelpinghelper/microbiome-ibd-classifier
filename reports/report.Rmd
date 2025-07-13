@@ -1,5 +1,5 @@
 ---
-title: "report"
+title: "ML Predictor of IBD Status from Microbiome Profiles"
 author: 
   - name: Paul B. Popa
     email:
@@ -11,7 +11,7 @@ output:
     toc_float: true
     toc_depth: 2
     code_folding: show
-date: "`r doc_date()`"
+date: "`r Sys.Date()`"
 vignette: >
   %\VignetteIndexEntry{Age metaaanalysis}
   %\VignetteEngine{knitr::rmarkdown}
@@ -43,30 +43,23 @@ knitr::opts_chunk$set(
 )
 ```
 
-# ML Predictor of IBD Status from Microbiome Profiles
+## Packages 
 
 ```{r packages, message = FALSE}
 library(caret)
 library(curatedMetagenomicData)
 library(dplyr)
 library(DT)
-library(doFuture) # multicore backend; doesn't fail on dir with spaces, unlike doSNOW
 library(furrr)
 library(ggplot2)
-library(groupdata2)
-library(here)
 library(mia)
 library(microbiome)
 library(phyloseq)
 library(plotly)
 library(pROC)
-library(progressr)  # for progress bar
 library(PRROC)
 library(purrr)
 library(randomForest)
-library(ResourceSelection)
-library(rsample)
-library(rstatix)
 library(SummarizedExperiment)
 library(table1)
 library(tidymodels)
@@ -77,11 +70,6 @@ library(TreeSummarizedExperiment)
 options(DT.fillContainer = FALSE,   
         DT.options = list(scrollY = "500px", scrollX = TRUE, scrollCollapse = FALSE, paging = FALSE)
 )
-```
-
-```{r}
-data_raw  <- here("data", "raw")
-data_proc <- here("data", "processed")
 ```
 
 ## Retrieval of datasets from IBD-associated studies
