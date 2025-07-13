@@ -1,0 +1,1268 @@
+---
+title: "report"
+author: 
+  - name: Paul B. Popa
+    email:
+    - ppopa93@gmail.com
+output: 
+  BiocStyle::html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: show
+date: "`r doc_date()`"
+vignette: >
+  %\VignetteIndexEntry{Age metaaanalysis}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}  
+---
+
+```{=html}
+<style>
+pre {
+  overflow-x: auto;
+}
+pre code {
+  word-wrap: normal;
+  white-space: pre;
+  max-width: 1000px
+}
+</style>
+```
+
+```{r setup, include = FALSE}
+library(kableExtra)
+
+options(width = 120)
+knitr::opts_chunk$set(
+    collapse = TRUE,
+    comment = "#>",
+    crop = NULL, ## Related to https://stat.ethz.ch/pipermail/bioc-devel/2020-April/016656.html,
+    tidy.opts=list(width.cutoff=120)
+)
+```
+
+# ML Predictor of IBD Status from Microbiome Profiles
+
+```{r packages, message = FALSE}
+library(caret)
+library(curatedMetagenomicData)
+library(dplyr)
+library(DT)
+library(doFuture) # multicore backend; doesn't fail on dir with spaces, unlike doSNOW
+library(furrr)
+library(ggplot2)
+library(groupdata2)
+library(here)
+library(mia)
+library(microbiome)
+library(phyloseq)
+library(plotly)
+library(pROC)
+library(progressr)  # for progress bar
+library(PRROC)
+library(purrr)
+library(randomForest)
+library(ResourceSelection)
+library(rsample)
+library(rstatix)
+library(SummarizedExperiment)
+library(table1)
+library(tidymodels)
+library(tidyverse)
+library(TreeSummarizedExperiment)
+
+# setup
+options(DT.fillContainer = FALSE,   
+        DT.options = list(scrollY = "500px", scrollX = TRUE, scrollCollapse = FALSE, paging = FALSE)
+)
+```
+
+```{r}
+data_raw  <- here("data", "raw")
+data_proc <- here("data", "processed")
+```
+
+## Retrieval of datasets from IBD-associated studies
+
+```{r tse-object}
+data("sampleMetadata")
+
+# what diseases do we have available?
+availablediseases <- pull(sampleMetadata, study_condition) %>%
+  table() %>%
+  sort(decreasing = TRUE)
+availablediseases
+
+# get list of IBD studies
+list_ibd_studies <- filter(sampleMetadata, study_condition %in% "IBD") %>% pull(study_name) %>% unique() 
+list_ibd_studies
+
+# create TSE object -- note that 'counts' is FALSE by default
+se <- suppressMessages(
+  sampleMetadata %>%
+    filter(study_name %in% list_ibd_studies & study_condition %in% c("IBD", "control")) %>%
+    returnSamples(dataType = "relative_abundance", counts = TRUE)
+)
+```
+
+## Exploration
+
+### Cohort characteristics
+
+```{r cohort characteristics}
+table1::table1( ~ disease + disease_subtype + age + gender + study_name,
+                data = colData(se))
+```
+
+### Convert TSE to phyloseq object
+
+```{r name to counts}
+# still a bug when working with counts...change name to 'counts' from 'relative_abundance' to be able to convert to phy using convertToPhyloseq
+assayNames(se) <- "counts"
+```
+
+```{r convert to phyloseq}
+phy <- mia::convertToPhyloseq(se, assay.type = "counts")
+phy
+```
+
+Note that we have multiple samples per subject ID, i.e., our there is not a 1:1 mapping between sample and subject. This violates the assumption that each observation is independent. Additionally, subjects with more time points contribute disproportionately to alpha- and beta-diversity calculations, skewing measures of community richness and dissimilarity.
+
+### Investigate pre-filtered data
+
+```{r n_species}
+n_species <- tax_table(phy) %>%
+  as("matrix") %>%                                # force a plain character matrix
+  as_tibble() %>%                                 # now a tibble
+  filter(!is.na(species), species != "") %>%      # drop NA or blank
+  summarise(n = n()) %>%                          # count species
+  pull(n)
+
+n_species
+```
+
+So we have 940 TaxonID-level features, but 935 species-level features. Do we drop them?
+
+```{r nan species rows}
+# turn tax_table from s4 obj to tibble
+tax_df <- tax_table(phy) %>%
+  as("matrix") %>%
+  as_tibble(rownames = "TaxonID")
+
+# turn sample_data from s4 obj to tibble
+samp_df <- sample_data(phy) %>%
+  as("matrix") %>%
+  as_tibble(rownames = "SampleID")
+
+# turn otu_table from s4 obj to tibble, with cols: TaxonID, Sample1, Sample2, …, SampleN
+otu_df <- otu_table(phy) %>%
+  as("matrix") %>%
+  {if (!taxa_are_rows(phy)) t(.) else .} %>%
+  as_tibble(rownames = "TaxonID")
+
+# make otu_long have one row for every (TaxonID, SampleID) combo where count > 0
+otu_long <- otu_df %>%
+  pivot_longer(
+    cols = -TaxonID,
+    names_to  = "SampleID",
+    values_to = "Count"
+  ) 
+
+# join otu_long to samp_df so that each row also carries its “study”
+otu_with_study <- otu_long %>%
+  dplyr::left_join(samp_df, by = "SampleID")
+
+# collect unique set of studies where each TaxonID appears
+tax_study <- otu_with_study %>%
+  group_by(TaxonID) %>%
+  summarize(
+    # collapse unique study names into a comma‐separated string (or keep as list)
+    Studies = paste0(study_name, collapse = "; "),
+    # check if Count = 0 for all values for each TaxonID
+    Counts_in_study = if (all(Count == 0)) {  
+      "All 0"
+    } else {
+      paste0(Count, collapse = "; ")
+    }
+  ) %>%
+  ungroup()
+
+na_species_with_study <- tax_table(phy) %>%
+  as("matrix") %>%                               
+  as_tibble(rownames = "TaxonID") %>%                                
+  filter(is.na(species) | species == "") %>%
+  dplyr::left_join(tax_study, by = "TaxonID")
+
+na_species_with_study
+```
+
+Even though the species is NA, we have counts for the TaxonID, so we should focus on the TaxonID.
+
+## $\alpha$-diversity
+
+Next, we want to better understand the control vs IBD data. We'll look at $\alpha$-diversity and use two indices: Shannon and Simpson (see here for further info on [Shannon](#shannon-index) and [Simpson](#simpson-index)), to better understand how "diverse" the community is by combining info about richness (how many taxa) and evenness (how evenly their abundances are distributed).
+
+Note that, since we used `counts = TRUE`, the counts are rounded, which has led to no singletons. This means we cannot estimate richness metrics such as Observed or Chao1. We have left "Observed" as a measure to display the warning that we in fact do not have singletons.
+
+```{r alpha-diversity pre-filtered, echo=TRUE}
+
+# Extract richness from counts
+#    a) remove sequencing noise and artifacts
+#    b) reduces overestimation of diversity
+#    c) improve comparability across samples
+#    d) improve statistical validity (e.g., avoid unneccesarily inflating Type I error)
+
+# estimate_richness provides per-sample diversity indices
+alpha_raw <- estimate_richness(physeq = 
+  phy,  
+  measures = c("Shannon", "Simpson", "Observed")
+)
+
+# create df that combines metadata with richness estimates
+div_df <- data.frame(
+  sample = sample_names(phy),
+  study_condition = sample_data(phy)$study_condition,
+  Shannon = alpha_raw$Shannon,
+  Simpson_D = alpha_raw$Simpson,
+  InvSimpson = 1 - alpha_raw$Simpson      # (1 – D)
+)
+
+# boxplot Shannon by group
+ggplot(div_df, aes(x = study_condition, y = Shannon, fill = study_condition)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Shannon Diversity by Study Condition (Pre-filtered)",
+       x = "Condition", y = "Shannon Index")
+
+# boxplot Simpson Diversity (1-D) by group
+ggplot(div_df, aes(x = study_condition, y = InvSimpson, fill = study_condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Simpson Diversity (1 - D) by Study Condition (Pre-filtered)",
+       x = "Condition", y = "Simpson Index (1 - D)")
+
+# boxplot Simpson Diversity (D) by group
+ggplot(div_df, aes(x = study_condition, y = Simpson_D, fill = study_condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Simpson Diversity (D) by Study Condition (Pre-filtered)",
+       x = "Condition", y = "Simpson Index (D)")
+```
+
+### Plot prevalence histogram
+
+```{r prevalence histogram}
+# extract OTU table as a matrix
+otu_mat <- as(otu_table(phy), "matrix")
+
+# make sure rows = taxa, columns = samples. If phy has taxa as columns, transpose it
+if (!taxa_are_rows(phy)) {
+  otu_mat <- t(otu_mat)
+}
+
+# calculate prevalence: number of samples in which each taxon has count > 0
+prevalence_df <- data.frame(
+  Taxon      = rownames(otu_mat),
+  prevalence = rowSums(otu_mat > 0)
+) %>% 
+  mutate(prevalence_prop = prevalence / nsamples(phy)) %>%
+  arrange(-prevalence)
+
+
+# bar plot of prevalence
+ggplot(prevalence_df, aes(x = factor(prevalence))) +
+  geom_bar(fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Taxon Prevalence (Discrete Count)",
+    x     = "Prevalence (number of samples)",
+    y     = "Number of Taxa"
+  ) +
+  scale_x_discrete(
+    breaks = as.character(seq(0, max(prevalence_df$prevalence), by = 5))
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+  )
+
+```
+
+#### View subset
+
+```{r subset of prevalence histogram}
+# plot subset that have > 5 prevalence
+ggplot(prevalence_df %>% 
+         group_by(prevalence) %>% 
+         filter(n() > 5) %>%
+         ungroup(), 
+       aes(x = factor(prevalence))) +
+  geom_bar(fill = "steelblue", color = "white") +
+  theme_minimal() +
+  labs(
+    title = "Taxon Prevalence (Discrete Count)",
+    x     = "Prevalence (number of samples)",
+    y     = "Number of Taxa"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+  )
+
+# table view
+DT::datatable(
+  prevalence_df %>% 
+    filter(prevalence > 5) %>%
+    arrange(-prevalence)
+  ) 
+```
+
+### Filter low-abundance taxa
+
+Ideally, we capture every taxon. However,
+
+```{r taxa filter table}
+# define grid of parameters
+params <- expand.grid(
+  min_reads            = c(1, 2, 3, 4, 5, 10, 50, 100, 200, 500, 1000, 2000),
+  min_prevalence_prop  = c(0.001, 0.01, 0.05, 0.1, 0.2, 0.5), # number of samples
+  stringsAsFactors     = FALSE
+)
+
+# for each row in params, filter taxa and record how many remain
+keep_counts <- params %>%
+  pmap_dfr(function(min_reads, min_prevalence_prop) {
+    # keep taxa observed in >= min_reads in > min_prevalence_count
+    phy_filt <- filter_taxa(
+      phy,
+      function(x) sum(x >= min_reads) > (min_prevalence_prop * length(x)),
+      prune = TRUE
+    )
+    
+    # create a one‐row tibble of results
+    tibble(
+      min_reads           = min_reads,
+      min_prevalence_prop = min_prevalence_prop,
+      n_taxa_kept         = ntaxa(phy_filt)
+    )
+  })
+
+keep_counts %>% arrange(-n_taxa_kept)
+```
+
+```{r}
+max_counts <- apply(otu_table(phy), 1, max)
+hist(max_counts, breaks = 50, main="Taxa max read counts")
+```
+
+This is hard to read — let's "spread" the data, i.e., log-transform our data.
+
+```{r}
+# histogram plot of > 0 log-transformed counts
+mc <- max_counts[max_counts > 0]
+hist(log10(mc),
+     breaks = 50,
+     main   = "Log-scaled Taxa Max Read Counts",
+     xlab   = "Max read count (log scale)"
+     )
+```
+
+Note that the left tail (at around 2-3) implies "rare" taxa, while the right tail (at around \> 6) implies highly dominant taxa.
+
+```{r retained taxa by filtering threshold plot}
+
+# plot impact of filtering 
+ggplot(keep_counts, aes(x = min_reads, y = n_taxa_kept, color = factor(min_prevalence_prop))) +
+  geom_line() +
+  geom_point() +
+  scale_color_discrete(
+    name   = "Prevalence Proportion",         # legend title
+    labels = function(x) percent(as.numeric(x), accuracy = 0.1)     # 0.05 to 5%
+  ) +
+  theme_minimal() +
+  labs(
+    title = "How number of retained taxa varies with filtering thresholds",
+    x = "Minimum Read-Count (x >= min_read)",
+    y = "Number of Taxa Kept"
+  )
+```
+
+We need to balance noise removal and biological signal. Let's investigate the phylum breakout to make sure we don't lose phylums with \> 1 prevalence.
+
+```{r phylum inspection (pre-filter)}
+# Check phylum‐level breakdown of the M taxa kept to make sure don't filter out entire Phyla, 
+# pre-filter
+tax_table_df <- as.data.frame(table(tax_table(phy)[, "phylum"])) %>% 
+  arrange(-Freq) %>%
+  rename(
+    phylum     = Var1,
+    freq_orig  = Freq
+  ) %>%
+  mutate(
+    Percent_phylum_orig = round((freq_orig / sum(freq_orig)) * 100, 1)
+  )
+
+str(tax_table_df)
+tax_table_df
+```
+
+```{r filter phyloseq obj}
+# keep taxa with reads >= 100 in at least 1% of samples 
+phy_filtered <- filter_taxa(phy, function(x) sum(x >= 100) > (0.01 * length(x)), TRUE)
+message("Kept ", ntaxa(phy_filtered), " out of ", ntaxa(phy), " taxa.\n")
+
+```
+
+```{r phylum inspection (post-filter)}
+# check phylum‐level breakdown of the M taxa kept to make sure don't filter out entire Phyla, 
+# post-filter
+tax_table_filtered_df <- as.data.frame(table(tax_table(phy_filtered)[, "phylum"])) %>% 
+  arrange(-Freq) %>%
+  rename(
+    phylum    = Var1,
+    freq_sub  = Freq
+  )
+
+str(tax_table_filtered_df)
+tax_table_filtered_df
+```
+
+```{r, tax table comparison}
+merged_tax_table_df <- merge(
+  tax_table_df,
+  tax_table_filtered_df,
+  by    = "phylum",
+  all.x = TRUE
+  ) %>%
+  mutate(
+    # Compute percent of Freq_sub of original
+    Percent_phylum_sub_of_orig = round((freq_sub / sum(freq_orig)) * 100, 1),
+    Percent_freq_sub_of_orig   = round((freq_sub / freq_orig) * 100, 1)
+  ) 
+
+
+DT::datatable(merged_tax_table_df)
+```
+
+So we end up losing 8 taxa, but these are rare. Recall our task is RF classification. Filtering rare taxa (even up to moderate prevalence thresholds) reduces $\alpha$-diversity differences between batches and alleviates technical variability, while maintaining $\beta$-diversity structure. Additionally, in disease studies, filtering retains significant taxa and preserves RF AUC for classification tasks [[1](#ref)].
+
+We will choose 1% as our threshold, which seems like a good balance of signal vs noise while still retaining a broad range of taxa.
+
+## Investigate filtered data
+
+### How does “diversity” differ between IBD vs. control
+
+$\alpha$-diversity often differs in disease vs. healthy (e.g., IBD typically has lower Shannon). We first visualize and then perform a formal test (i.e., [Wilcoxon rank-sum test](#wilcoxon-test)) to qualitatively and quantitatively compare the groups before jumping to our ML analysis.
+
+```{r alpha-diversity (post-filter), echo=TRUE}
+
+# Extract richness from the raw counts
+#    a) remove sequencing noise and artifacts
+#    b) reduces overestimation of diversity
+#    c) improve comparability across samples
+#    d) improve statistical validity (e.g., avoid unneccesarily inflating Type I error)
+alpha_raw <- estimate_richness(
+  phy_filtered,  
+  measures = c("Shannon", "Simpson")
+) 
+
+alpha_raw
+
+# Build a data.frame that combines metadata with these richness estimates. 
+div_df <- data.frame(
+  sample          = rownames(alpha_raw),
+  study_condition = sample_data(phy_filtered)$study_condition,
+  Shannon         = alpha_raw$Shannon,
+  Simpson_D       = alpha_raw$Simpson,       # raw D
+  InvSimpson      = 1 - alpha_raw$Simpson    # (1 – D)
+)
+div_df
+
+# Boxplot Shannon by group
+ggplot(div_df, aes(x = study_condition, y = Shannon, fill = study_condition)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Shannon Diversity by Study Condition (Filtered)",
+       x = "Condition", y = "Shannon Index")
+
+# Boxplot Simpson Diversity (1-D) by group
+ggplot(div_df, aes(x = study_condition, y = InvSimpson, fill = study_condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Simpson Diversity (1 - D) by Study Condition (Filtered)",
+       x = "Condition", y = "Simpson Index (1 - D)")
+
+# Boxplot Simpson Diversity (D) by group
+ggplot(div_df, aes(x = study_condition, y = Simpson_D, fill = study_condition)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "Simpson Diversity (D) by Study Condition (Filtered)",
+       x = "Condition", y = "Simpson Index (D)")
+```
+
+Shannon Index
+
+-   IBD Median Shannon Index $<$ control Median Shannon Index $\implies$ less microbial diversity than control
+
+-   Low-Shannon outliers in IBD: could reflect patients whose gut communities have lost many taxa (very few species or highly uneven communities), often interpreted as dysbiosis
+
+Simpson Diversity (1 - D)
+
+-   Visually shows us that we have a relatively low diversity (i.e., 1 - D is closer to 0).
+
+### Statistical test
+
+We use the [Wilcoxon-rank test](#wilcoxon-test).
+
+$H_0$: The Shannon distributions in control and IBD come from the same population (i.e., no difference in median diversity).
+
+$H_a$: The Shannon distributions in control and IBD differ (i.e., one group tends to have higher or lower Shannon).
+
+```{r Wilcoxon-rank test}
+div_df %>%
+  wilcox_test(Shannon ~ study_condition) %>%
+  add_significance("p")
+```
+
+```{r alpha-test (filtered), echo=TRUE}
+div_df %>%
+  # requires "coin" package
+  wilcox_effsize(  # rank-biserial correlation
+    Shannon ~ study_condition,
+    alternative = "two.sided",
+    conf.level  = 0.95,
+    ci          = TRUE
+  )
+
+```
+
+Given our extremely small p-value, i.e., $p\ll 0.05$, we reject the null hypothesis. There is statistically significant evidence that the Shannon index in controls is not drawn from the same distribution as in IBD.
+
+This confirms that IBD patients in our cohort exhibit significantly reduced gut‐microbial $\alpha$‐diversity (Shannon index) compared to controls.
+
+Rank-biserial correlation
+
+-   can be interpreted roughly like a Pearson r.
+
+    -   \|r\| $\approx$ 0.1 (small), $\approx$ 0.3 (medium), $\approx$ 0.5 (large)
+
+effsize = 0.116 $\implies$ small rank-biserial correlation, indicating that control samples tend to have higher Shannon than IBD samples.
+
+### CLR-Transform
+
+Microbiome count tables are compositional — each sample’s taxa counts are only meaningful *relative* to one another and sum to an arbitrary total. The [**centered log-ratio (CLR) transform**](#clr) maps those compositions into real space so that standard multivariate methods (e.g. distance measures, classifiers) behave properly.
+
+In the context of the Random Forest model, the CLR-transform removes sequencing-depth effects, stablizes variance, centers the features (so that each is on a comparable scale across samples), and respects compositional structure (ensuring measured distances between feature vectors reflect relative changes in taxa, not absolute counts).
+
+```{r CLR-transform}
+# clr-transform
+phy_clr <- microbiome::transform(phy_filtered, "clr")
+message("After CLR-transform: ntaxa = ", ntaxa(phy_clr), ", nsamples = ", nsamples(phy_clr))
+```
+
+## Train
+
+### Define Random Forest Model
+
+```{r train_rf() func}
+train_rf <- function(phy_clr, 
+                     n_folds    = 5, 
+                     n_repeats  = 3, 
+                     seed       = 43,    # for reproducibility
+                     trees      = 500) { # number of trees
+  
+  set.seed(seed)
+  
+  # extract feature matrix (samples by taxa) and metadata
+  otu_mat  <- t(as(otu_table(phy_clr), "matrix"))
+  meta_df  <- as(sample_data(phy_clr), "data.frame") %>%
+    as_tibble(rownames = "SampleID") %>%
+    mutate(
+      Outcome   = factor(study_condition, levels = c("control","IBD")),
+      SubjectID = as.character(subject_id)  # ensure character
+    )
+  
+  # sanitize names so randomForest() doesn't yell
+  colnames(otu_mat) <- make.names(colnames(otu_mat))
+  
+  data_all <- as_tibble(otu_mat, rownames = "SampleID") %>%
+    dplyr::left_join(meta_df, by = "SampleID")
+  
+  message("Full data: ", nrow(data_all), " samples × ", ncol(otu_mat), " taxa; ",
+          length(unique(data_all$SubjectID)), " subjects.")
+  
+  # grab feature cols
+  feature_cols <- colnames(otu_mat)  
+  
+  # pre-allocate lists for storing ROC objects & probabilities
+  roc_list   <- list()   # pROC::roc objects
+  probs_list <- list()   # numeric vectors of predicted probs
+  labels_list <- list()  # test-set labels
+  idx        <- 1        # running index
+
+  
+  # function to do one round of grouped k-fold CV
+  one_repeat <- function(rep_id) {
+    # shuffle and split unique subjects into folds
+    subs      <- unique(data_all$SubjectID)
+    subs      <- sample(subs)
+    fold_ids  <- cut(seq_along(subs), breaks = n_folds, labels = FALSE)
+    subject_folds <- split(subs, fold_ids)
+    
+    # for each fold, train, test, compute AUC
+    purrr::map_dfr(seq_along(subject_folds), function(k) {
+      
+      test_subj <- subject_folds[[k]]
+      
+      train_df <- filter(data_all, !SubjectID %in% test_subj) %>% 
+                    dplyr::select(all_of(feature_cols), Outcome)
+      test_df  <- filter(data_all,  SubjectID %in% test_subj) %>% 
+                    dplyr::select(all_of(feature_cols), Outcome)
+      
+      rf_mod <- randomForest(
+        Outcome ~ .,
+        data    = train_df,
+        ntree   = trees
+      )
+      
+      # predict probabilities for positive class "IBD"
+      probs   <- predict(rf_mod, test_df, type = "prob")[, "IBD"]
+      roc_obj <- roc(test_df$Outcome, probs, quiet = TRUE)
+      
+      # store for later
+      probs_list[[idx]]    <<- probs
+      roc_list[[idx]]      <<- roc_obj
+      labels_list[[idx]]   <<- test_df$Outcome
+      idx                  <<- idx + 1
+      
+      tibble(
+        repeats    = rep_id,
+        fold       = k,
+        n_train    = nrow(train_df),
+        n_test     = nrow(test_df),
+        auc        = as.numeric(auc(roc_obj))
+      )
+    })
+  }
+  
+  # run repeats in parallel
+  cv_results <- future_map_dfr(seq_len(n_repeats), one_repeat, .options = furrr_options(seed = TRUE))
+  
+  # summarize
+  summary_df <- cv_results %>%
+    group_by(repeats) %>%
+    summarize(
+      mean_auc = mean(auc),
+      sd_auc   = sd(auc),
+      .groups  = "drop"
+    ) %>%
+    ungroup() %>%
+    mutate(overall_mean = mean(mean_auc),
+           overall_sd   = sd(mean_auc))
+  
+  list(
+    cv_folds    = cv_results,   # df of AUCs per fold
+    cv_summary  = summary_df,   # summary of AUCs
+    probs_list  = probs_list,   # list of numeric vectors of probabilities
+    roc_list    = roc_list,     # list of pROC::roc objects
+    labels_list = labels_list   # list of test-set labels
+  )
+}
+```
+
+### Train + Test model
+
+```{r Train RF}
+# train the model
+rf_workflow_fit <- train_rf(phy_clr)
+```
+
+## Results
+
+### Prediction of IBD vs control
+
+#### Plot ROC across folds
+
+```{r ROC across folds plot}
+# create ROC df
+roc_df <- purrr::imap_dfr(rf_workflow_fit$roc_list, function(roc_obj, i) {
+  data.frame(
+    Fold       = paste0("Fold ", i),
+    FPR        = 1 - roc_obj$specificities,
+    TPR        = roc_obj$sensitivities
+  )
+})
+
+# plot ROC
+ggplot(roc_df, aes(x = FPR, y = TPR, color = Fold)) +
+  geom_line(linewidth = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title = "ROC Across Folds",
+    x     = "False Positive Rate",
+    y     = "True Positive Rate"
+  ) +
+  theme_minimal()
+```
+
+We see the each fold's ROC trade-off between TPR (sensitivity) and FPR (1-specificity). Looking across all folds helps us gauge the stability of our classifier. Given the wide spread signals, our classifier might depend on the training/test split. Let's investigate.
+
+#### Plot Average ROC with Confidence Bands
+
+```{r average ROC plot}
+# define grid
+fpr_grid <- seq(0, 1, length.out = 200)
+
+# create per-fold interpolated TPRs at correct grid
+roc_df <- map_dfr(rf_workflow_fit$roc_list, ~{
+  roc_obj <- .
+  # interpolate TPR at desired FPRs via approx():
+  fpr     <- 1 - roc_obj$specificities
+  tpr     <- roc_obj$sensitivities
+  interp  <- approx(x = fpr, y = tpr, xout = fpr_grid, ties = mean)
+  tibble(FPR = fpr_grid, TPR = interp$y)
+}, .id = "Fold")
+
+# summarize mean and sd
+summary_roc <- roc_df %>%
+  group_by(FPR) %>%
+  summarize(
+    mean_TPR = mean(TPR, na.rm = TRUE),
+    sd_TPR   = sd(TPR, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# plot mean ROC
+ggplot(summary_roc, aes(x = FPR, y = mean_TPR)) +
+  geom_ribbon(aes(ymin = mean_TPR - sd_TPR,
+                  ymax = mean_TPR + sd_TPR),
+              fill  = "blue", alpha = 0.2) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(linetype = "dashed", color = "gray") +
+  labs(
+    title    = "Mean ROC Across Folds",
+    subtitle = sprintf("AUC = %.3f ± %.3f",
+                       mean(sapply(rf_workflow_fit$roc_list, auc)),
+                       sd  (sapply(rf_workflow_fit$roc_list, auc))),
+    x        = "False Positive Rate",
+    y        = "True Positive Rate"
+  ) +
+  theme_minimal()
+```
+
+#### Quantify AUC Variability
+
+```{r AUC}
+# per‐fold AUC vector
+aucs <- rf_workflow_fit$cv_folds$auc
+
+# basic descriptors
+mean_auc <- mean(aucs); sd_auc <- sd(aucs)
+cat(sprintf("Mean AUC = %.3f ± %.3f\n", mean_auc, sd_auc))
+
+# 95% CI via bootstrapping across folds
+boot_ci <- boot::boot(aucs, statistic = function(u, i) mean(u[i]), R = 2000)
+ci_vals <- boot::boot.ci(boot_ci, type = "perc")$percent[4:5]
+cat(sprintf("Bootstrap 95%% CI: [%.3f, %.3f]\n", ci_vals[1], ci_vals[2]))
+```
+
+#### Calibration Curves
+
+Calibration shows how predicted probabilities map to observed frequencies.
+
+```{r calibration plot}
+# create calibration df
+calib_df <- purrr::imap_dfr(
+  rf_workflow_fit$probs_list,
+  ~ tibble(
+      Prob = .x,
+      Obs  = rf_workflow_fit$labels_list[[.y]]
+    )
+)
+
+# caret::calibration object
+calib_obj <- caret::calibration(
+  Obs ~ Prob,
+  data   = calib_df,
+  class  = "IBD",
+  cuts   = 10  # number of bins
+)
+
+# plot calibration
+ggplot(calib_obj, bwidth = 2, dwidth = 3) +
+  labs(
+    title = "Calibration Plot",
+    x     = "Predicted Probability Bin",
+    y     = "Observed Event Rate (%)"
+  )
+```
+
+The diagonal reference line represents perfect calibration: predicted probability = observed frequency. Points above the line means the model’s predictions in that bin are too low (it underestimates risk), while points below the line means predictions are too high (it overestimates risk).
+
+The width of the each error bar indicates how reliable the calibration is in that bin. Note that the wide error bars in the first bin is between 0-37%, which means that there may be very few IBD cases in that range, so we should be cautious in our interpretation.
+
+However, looking at our bins, we actually see that there are *no* predictions in the first bin, which explains the very wide confidence bound since confidence intervals were forced on zero counts.
+
+```{r calibration bins table}
+calib_obj$data
+```
+
+Let's look at bins by risk.
+
+-   **Low-Risk Bins** (left side, 10-30% predicted):
+
+    -   Beginning at bin 2, where we actually observed outcomes in that probability range, our model is slightly over-confident: it gives 15% when the true rate is \~2%.
+
+-   **Mid-Risk Bins** (around 25–55% predicted):
+
+    -   The observed rates lie almost exactly on the diagonal, with narrow confidence intervals. Our model is **well calibrated** in the mid-probability range, leading to confidence in its risk estimates around “coin-flip” probabilities.
+
+<!-- -->
+
+-   **High-Risk Bins** (right side, 65-95% predicted):
+
+    -   There is a slight underestimation of risk around the 75–95% region (points just below the diagonal), meaning the model is a bit **under-confident**: it gives 95% when the true rate is \~88 %, and 75% when the true rate is \~78 %.
+
+    -   However, these deviations are modest and well within the narrow confidence bands, indicating acceptable performance even at extreme probabilities.
+
+Let's further assess our model by checking how accurate our predictions are, on average. We will use the [Brier score](#brier), which quantifies overall calibration, with lower values indicating better calibration.
+
+#### Brier Score
+
+```{r brier score}
+calib_df <- calib_df %>%
+  mutate(
+    OutcomeNum = as.integer(Obs == "IBD")  # 1 when Obs == "IBD", 0 otherwise
+  )
+
+# manual calculation
+brier_score <- calib_df %>%
+  summarise(Brier = mean((Prob - OutcomeNum)^2)) %>%
+  pull(Brier)
+
+brier_score
+```
+
+Our Brier score is closer to 0, which implies overall good calibration and discrimination. Let's now compare how much better this is than baseline, i.e., calculate Brier Skill Score (BSS).
+
+```{r BSS}
+# calculate IBD prevalence
+prevalence <- mean(calib_df$OutcomeNum)
+cat("IBD prevalence:", round(prevalence * 100, 1), "%\n")
+
+# calculate BS_{ref}
+BS_ref <- prevalence * (1 - prevalence)
+cat("BS_ref:", BS_ref, "\n")
+
+# calculate BSS
+BSS = 1 - (brier_score)/BS_ref
+cat("BSS:", BSS)
+```
+
+BS_ref can be viewed as a "no-skill" baseline, in which this naive model always predicts the overall IBD prevalence 20%. Our result, 15.3%, is less than BS_ref, with BSS indicating a 23% improvement over baseline.
+
+### Precision-Recall Curves
+
+Let's first quantify class imbalance.
+
+```{r}
+# flatten labels_list into one factor vector
+all_labels <- unlist(rf_workflow_fit$labels_list, use.names = FALSE)
+
+tab   <- table(all_labels)
+pct   <- prop.table(tab) * 100
+
+tab
+
+pct
+```
+
+So we see that IBD dominates control (72% vs 28%).
+
+```{r}
+# create PRROC objects per fold
+pr_list <- imap(rf_workflow_fit$probs_list, function(probs, i) {
+  labels <- rf_workflow_fit$labels_list[[i]]
+  fg     <- probs[labels == "IBD"]       # scores for the positive class
+  bg     <- probs[labels == "control"]   # scores for the negative class
+
+  pr.curve(
+    scores.class0 = fg,
+    scores.class1 = bg,
+    curve         = TRUE
+  )
+})
+
+# create PR df
+pr_df <- purrr::imap_dfr(pr_list, function(pr, i) {
+  as.data.frame(pr$curve) %>%
+    setNames(c("Recall", "Precision", "Threshold")) %>%
+    mutate(Fold = paste0("Fold ", i))
+})
+
+# plot PR
+ggplot(pr_df, aes(x = Recall, y = Precision, color = Fold)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Precision–Recall Curves Across Folds",
+    x     = "Recall",
+    y     = "Precision"
+  ) +
+  theme_minimal()
+```
+
+The clustering of curves near the top‐left indicates generally high precision even at moderate recall, while the spread between them reflects fold‐to‐fold variability in performance.
+
+Let's look at our case broken out into three components: the high-precision, high-recall region, trade-off as recall increases, and fold-to-fold variability.
+
+-   High-precision, high-recall region
+
+    -   All folds achieve perfect precision at very low recall (selecting only the highest-confidence predictions). Where the curves run nearly flat, it means that we can increase recall (i.e., catch more true IBD cases) without sacrificing precision (few false positives).
+
+-   Trade-off as recall increases
+
+    -   Precision slowly declines as we increase recall, meaning that, if we want to capture more true positives, we have to admit more false positives. The slope of each fold's curve quantifies how rapidly precision deteriorates; flatter slopes are better (i.e., precision holds up longer).
+
+-   Fold-to-fold variability
+
+    -   The spread between curves reveals how stable the model's PR performance is across different train/test splits.
+
+So how good is our model at capturing true positives, i.e., IBD prevalence?
+
+### AUPRC {#auprc}
+
+Recall that IBD prevalence is 72%, which means that a random classifier has AUPRC = 0.72. Area Under the Precision–Recall Curve (AUPRC) summarizes a model’s ability to retrieve true positives without overwhelming false positives by integrating precision over all recall levels. AUPRC’s baseline equals the positive‐class prevalence, making it especially informative in imbalanced settings.
+
+```{r}
+auprcs <- purrr::map_dbl(pr_list, ~ .x$auc.integral)
+
+# Summary across folds
+mean_auprc <- mean(auprcs)
+sd_auprc   <- sd(auprcs) 
+
+cat(sprintf("Mean AUPRC = %.3f ± %.3f\n", mean_auprc, sd_auprc))
+```
+
+Since our mean AURPC = 0.892 ± 0.054 $>$ 0.72, our model performs better than a random classifier.
+
+Thus, a high AURPC alongside a low Brier score indicates both reliable probability estimates and strong discrimination.
+
+### Confusion Matrix
+
+```{r}
+# get predictions and labels
+results_df <- purrr::imap_dfr(
+  rf_workflow_fit$probs_list,
+  ~ tibble(
+      Fold       = paste0("Fold ", .y),
+      truth      = rf_workflow_fit$labels_list[[.y]],
+      .pred_prob = .x
+    )
+) %>%
+  # convert probabilities to class labels at 0.5 threshold
+  mutate(.pred_class = factor(if_else(.pred_prob > 0.5, "IBD", "control"),
+                              levels = levels(truth)))
+# re-level so IBD comes first to make sure we calculate metrics for the correct "positive" class
+results_df <- results_df %>%
+  mutate(
+    truth = fct_relevel(truth, "IBD", "control"),
+    .pred_class = fct_relevel(.pred_class, "IBD", "control")
+  )
+
+# compute the confusion matrix
+conf_mat_res <- results_df %>%
+  yardstick::conf_mat(truth = truth, estimate = .pred_class)
+
+# calculate metrics for binary classification
+
+# Sensitivity
+sens_res <- sens_vec(results_df$truth, results_df$.pred_class)
+# Specificity
+spec_res <- spec_vec(results_df$truth, results_df$.pred_class)
+# Precision
+ppv_res  <- precision_vec(results_df$truth, results_df$.pred_class)
+# F1‐score
+f1_res   <- f_meas_vec(results_df$truth, results_df$.pred_class)
+
+data.frame(
+  sens     = sens_res,
+  spec     = spec_res,
+  precision= ppv_res,
+  F1        = f1_res
+)
+
+# visualize the confusion matrix as heatmap
+p <- autoplot(conf_mat_res, type = "heatmap") 
+
+# remove whatever scales (including 'fill') were already there to avoid warning
+p$scales$scales <- list()
+
+# add custom fill scale
+  p +
+    scale_fill_gradient2(low = "white", high = "steelblue") +
+    labs(title = "Confusion Matrix",
+         subtitle = "Counts of predictions vs. truth") +
+    theme_minimal()
+```
+
+-   Sensitivity (Recall):
+
+    -   Calculation
+
+        -   $\dfrac{\text{TP}}{\text{TP} + \text{FN}} = \dfrac{5,913}{5,913 + 351} = 0.944$
+
+    -   What is it?
+
+        -   It measure the model's ability to detect true cases. Our model correctly identifies 94.4% of all IBD cases. This is valuable for medical screening where missing a case is costly.
+
+<!-- -->
+
+-   Specificity:
+
+    -   Calculation
+
+        -   $\dfrac{\text{TN}}{\text{TN} + \text{TP}} = \dfrac{875}{875 + 1,522} = 0.365$
+
+    -   What is it?
+
+        -   It quantifies how well the model rules out negatives (controls). Only 36.5% of control samples are correctly classified, indicating a high false-positive rate. Misclassifying healthy samples as IBD could lead to unnecessary follow-up tests.
+
+<!-- -->
+
+-   Precision:
+
+    -   Calculation
+
+        -   $\dfrac{\text{TP}}{\text{TP} + \text{FP}} = \dfrac{5,913}{5,913 + 1,522} = 0.795$
+
+    -   What is it?
+
+        -   It tells us the proportion of positive predictions that are actually correct. When our model predicts "IBD", it is correct 79.5% of the time. Precision is moderate and can be improved to reduce false positives.
+
+<!-- -->
+
+-   F1:
+
+    -   Calculation
+
+        -   $2 \times \dfrac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}} = \dfrac{2\; \text{TP}}{2\; \text{TP} + \text{FP} + \text{FN}} = \dfrac{2(5,913)}{2(5,913) + 1,522 + 351} = 0.863$
+
+    -   What is it?
+
+        -   The harmonic mean of precision and recall, giving equal weight to both metrics. The harmonic mean penalized extreme values, e.g., if either precision or recall is low, then the overall score will be driven down.
+
+        -   1.0 $\implies$ perfect precision and recall.\
+            0.5 $\implies$ as good as random guessing.\
+            0.0 $\implies$ either precision or recall (or both) is zero.
+
+# Conclusion
+
+We've classified subjects across several studies based on their gut microbiome samples, which may include repeat measurement samples, into two classes: IBD or control.
+
+Our first step was to explore the counts data. We looked at the cohort characteristics of the data across the different studies. We then looked at $\alpha$-diversity (Shannon/Simpson) and $\beta$-diversity to get a better understanding of the underlying data. We then proceeded to examine the data at the taxa-level to determine how to filter the data, ultimately deciding to keep taxa with reads $\geq$ 100 in at least 1% of samples.
+
+Our second step was to investigate the filtered data. We performed another $\alpha$-diversity analysis and ran the Wilcoxon-rank test, resulting in a rejection of the null hypothesis. That is, there is statistically significant evidence that the Shannon index in controls is not drawn from the same distribution as in IBD.
+
+Our third step was to create, train, and test a Random Forest model. To account for repeated measurements across subjects, which violates the i.i.d. assumption underlying cross-validation, we incorporated repeated grouped k-fold CV, in our case, k = 5 with 3 repeats per fold. We fed the model CLR-transformed, which removes distortions of compositional bias, OTU abundances as features, which are now on an appropriate, comparable scale.
+
+Our final step was to evaluate our model. We looked at ROC, AUC, calibration, precision-recall curves, AUPRC, and the confusion matrix and metrics. We determined that our model performs better than a random classifier, with a high AURPC alongside a low Brier score indicating both reliable probability estimates and strong discrimination.
+
+Future work can look to improve the false positive rate for controls and compare different models for classification.
+
+# Appendix: Definitions and Explanations
+
+## $\alpha$-diversity
+
+### Shannon Index {#shannon-index}
+
+The Shannon index $H$ quantifies both richness (number of taxa) and evenness (relative abundance distribution) in a single value. It is defined as
+
+$$
+H \;=\; -\sum_{i=1}^{S} p_i\,\ln(p_i)
+$$ where
+
+-   $S$ = total number of observed taxa (OTUs/ASVs) in the sample.
+
+-   $p_i$​ = proportion of reads belonging to taxon $i$ (i.e. $p_i = \frac{n_i}{\sum_{j=1}^S n_j}$, where $n_i$​ is the count of taxon $i$).
+
+#### Key properties:
+
+-   $H$ increases as (1) the number of taxa $S$ increases, and (2) the abundances become more even.
+
+-   Minimum $H=0$ occurs when one taxon comprises 100% of the sample.
+
+-   Maximum $H = \ln(S)$ occurs when all $S$ taxa are equally abundant ($p_i = 1/S$ for all $i$).
+
+### Simpson index {#simpson-index}
+
+The **Simpson index** measures dominance (or conversely, diversity) by focusing on the probability of picking two reads from the same taxon. There are two common forms:
+
+1.  **Raw Simpson (D):**
+
+    $$D \;=\; \sum_{i=1}^{S} p_i^2
+    $$
+
+    where, $D$ is the probability that two randomly drawn reads (with replacement) come from the same taxon.
+
+    -   \$ D \in \left[\frac{1}{S},\,1\right]\$
+
+        -   $D = 1$ if a single taxon dominates 100%.
+
+        -   $D=1/S$ if all $S$ taxa are equally abundant.
+
+2.  **Gini–Simpson or “Simpson’s Diversity” (1 – D):**
+
+    $$
+    1 - D \;=\; 1 \;-\; \sum_{i=1}^{S} p_i^2
+    $$
+
+    -   $1 - D \in \left[0,\,1 - \frac{1}{S}\right]$
+
+        -   $1 - D = 0$ when one taxon dominates entirely.
+
+        -   $1 - D$ approaches 1 as the community becomes more even and richly diverse.
+
+------------------------------------------------------------------------
+
+### Observed Richness {#observed-richness}
+
+**Observed richness** simply counts how many taxa (OTUs/ASVs) are present in a sample:
+
+$$S_{\text{obs}} \;=\; \sum_{i=1}^{S} \mathbb{1}(n_i > 0)
+$$
+
+where $\mathbb{1}(\cdot)$ is an indicator that equals 1 if taxon $i$ has at least one read. Thus, Observed richness measures raw taxon count without regard to abundance.
+
+------------------------------------------------------------------------
+
+#### Chao1 Estimator {#chao1-estimator}
+
+**Chao1** is a non‐parametric richness estimator that adjusts Observed richness for unseen (rare) taxa, using singletons (taxa with one read) and doubletons (two reads):
+
+$$
+\widehat{S}_{\text{Chao1}} \;=\; S_{\text{obs}} \;+\; \frac{f_1^2}{2\,f_2}
+$$ where
+
+-   $S_{\text{obs}}$​ = number of observed taxa.
+
+-   $f_1$​ = count of taxa observed exactly once.
+
+-   $f_2$​ = count of taxa observed exactly twice.
+
+When $f_2 = 0$ , one often uses a bias‐corrected form or sets $\widehat{S}_{\text{Chao1}} = S_{\text{obs}} + \frac{f_1(f_1 - 1)}{2}$
+
+------------------------------------------------------------------------
+
+## CLR-transform {#clr}
+
+The centered log-ratio transform is a mapping of each composition $x_i$ (either a taxon count or proportion) from the simplex $S^d$ into the unconstrained (real) subspace $\{ y \in \mathbb{R}^d : \sum_{i=1}^d y_i = 0 \}$.
+
+### Formula Summary
+
+For a sample with taxa counts (or proportions) $(x_1, x_2, ..., x_d)$, define the geometric mean
+
+$$
+g = \Bigl(\prod_{i=1}^d x_i\Bigr)^{1/d}
+$$
+
+Then the CLR‐transformed vector is
+
+$$
+\mathrm{clr}(x)_i \;=\; \log\!\bigl(\frac{x_i}{g(x)}\bigr)
+\quad\text{for } i=1,\dots,d.
+$$
+
+Because $\mathrm{clr}(x)_i = 0$, the transform removes the simplex constraint (i.e., the simplex constraint is that each sample's taxa counts (or proportions) $(x_1, x_2, ..., x_d)$ satisfy:
+
+1.  Non-negativity: $x_i \geq 0 \;\; \forall i \in \{1,...,d\}$
+2.  Constant-sum (closure) constraint: $\sum_{i=1}^d x_i = 1$ ),
+
+avoiding spurious correlations and misleading results that would arise from failing to meet the "unconstrained Euclidean space" assumption for PCA, Euclidean distances, and several classifiers.
+
+------------------------------------------------------------------------
+
+## Wilcoxon rank-sum test
+
+The Wilcoxon rank-sum test (also called the Mann–Whitney U test) is a non-parametric method for comparing two independent groups. It is an alternative to a two-sample t-test and does not assume normality, only that the two groups are independent and that the outcome is at least ordinal.
+
+### Quick summary
+
+1.  Pool all observations from both groups and rank them from smallest to largest.
+2.  Sum the ranks within each group.
+3.  Compute the test statistic $U$.
+4.  Use either an exact table (small samples) or a normal approximation (large samples) to obtain a p-value under the null hypothesis that the two groups come from the same distribution.
+    -   Since we have moderate/large samples, we can calculate Z as
+
+        $$
+        Z \;=\; \frac{U \;-\; \mu_U}{\sigma_U} 
+        $$ where$$
+        \mu_U = \frac{n_1\,n_2}{2}, 
+          \quad 
+          \sigma_U = \sqrt{\frac{n_1\,n_2\,(n_1 + n_2 + 1)}{12}}
+        $$
+
+### Formula summary
+
+-   **Ranks**: assign ranks to the pooled data.
+
+-   **Rank‐sum**:
+
+    $$
+    R_1 \;=\; \sum_{\text{all observations in group 1}} \text{(rank)}
+    $$
+
+-   **U statistic** for group 1:
+
+    $$
+    U_1 \;=\; R_1 \;-\; \frac{n_1(n_1 + 1)}{2}
+    $$
+
+-   **Mean and variance of U under** $H_0$:
+
+    $$
+    \mu_U = \frac{n_1\,n_2}{2}, 
+      \quad 
+      \sigma_U = \sqrt{\frac{n_1\,n_2\,(n_1 + n_2 + 1)}{12}}
+    $$
+
+-   Z**-score approximation**:
+
+    $$
+    Z = \frac{U - \mu_U}{\sigma_U}
+    $$
+
+-   **Two‐sided p‐value** (for large samples):
+
+    $$
+    p = 2 \times P\bigl(|Z| \ge |Z_{\text{observed}}|\bigr)
+    $$
+
+------------------------------------------------------------------------
+
+## Brier score {#brier}
+
+A proper scoring rule that measures the accuracy of probabilistic predictions for binary outcomes by computing the mean squared difference between predicted probabilities and actual outcomes. A lower Brier score indicates better calibration and discrimination, with a perfect score of 0 and a worst score of 1.
+
+### Formula summary
+
+For **binary** events, the Brier score is defined as:
+
+$$\text{Brier Score} 
+= \frac{1}{N} \sum_{i=1}^{N} (p_i - o_i)^2
+$$
+
+where:
+
+-   $p_i$ is the predicted probability of the positive class for instance $i$,
+
+-   $o_i$ is the observed outcome (1 if the event occurred, 0 otherwise),
+
+-   $N$ is the number of forecasts
+
+This can be thought of as the mean squared error of the predicted probabilities.
+
+------------------------------------------------------------------------
+
+# References {#ref}
+
+1.  Cao Q, Sun X, Rajesh K, Chalasani N, Gelow K, Katz B, Shah VH, Sanyal AJ, Smirnova E. Effects of Rare Microbiome Taxa Filtering on Statistical Analysis. Front Microbiol. 2021 Jan 12;11:607325. doi: 10.3389/fmicb.2020.607325. PMID: 33510727; PMCID: PMC7835481.
